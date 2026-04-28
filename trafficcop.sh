@@ -19,11 +19,11 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：1.0.84"| tee -a "$LOG_FILE"
 # 在脚本开始时杀死所有其他 traffic_monitor.sh 进程
 kill_other_instances() {
     local current_pid=$$
-    local script_name=$(basename "\$0")
+    local script_name=$(basename "$0")
     for pid in $(pgrep -f "$script_name"); do
         if [ "$pid" != "$current_pid" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 终止其他脚本实例 (PID: $pid)" | tee -a "$LOG_FILE"
-            kill $pid
+            kill "$pid"
         fi
     done
 }
@@ -321,68 +321,80 @@ initial_config() {
     write_config
 }
 
+# 日期工具：按目标月份最大天数钳制周期起始日，避免 31 号在小月失效
+days_in_month() {
+    local year=$1
+    local month=$2
+    date -d "$(printf '%04d-%02d-01' "$year" "$month") +1 month -1 day" +%d
+}
+
+add_months() {
+    local year=$1
+    local month=$2
+    local delta=$3
+    local total=$((year * 12 + month - 1 + delta))
+    printf '%04d %02d\n' "$((total / 12))" "$((total % 12 + 1))"
+}
+
+period_anchor_date() {
+    local year=$1
+    local month=$2
+    local period_day=${PERIOD_START_DAY:-1}
+    local max_day=$((10#$(days_in_month "$year" "$month")))
+
+    if [ "$period_day" -gt "$max_day" ]; then
+        period_day=$max_day
+    fi
+
+    printf '%04d-%02d-%02d\n' "$year" "$month" "$period_day"
+}
+
+get_period_month_step() {
+    case $TRAFFIC_PERIOD in
+        quarterly) echo 3 ;;
+        yearly) echo 12 ;;
+        *) echo 1 ;;
+    esac
+}
+
+get_period_anchor_month() {
+    local current_month=$((10#$(date +%m)))
+
+    case $TRAFFIC_PERIOD in
+        quarterly) echo $((((current_month - 1) / 3) * 3 + 1)) ;;
+        yearly) echo 1 ;;
+        *) echo "$current_month" ;;
+    esac
+}
+
 # 获取当前周期的起始日期
 get_period_start_date() {
     local current_date=$(date +%Y-%m-%d)
-    local current_month=$(date +%m)
-    local current_year=$(date +%Y)
-    
-    case $TRAFFIC_PERIOD in
-        monthly)
-            if [ $(date +%d) -lt $PERIOD_START_DAY ]; then
-                date -d "${current_year}-${current_month}-${PERIOD_START_DAY} -1 month" +'%Y-%m-%d'
-            else
-                date -d "${current_year}-${current_month}-${PERIOD_START_DAY}" +%Y-%m-%d 2>/dev/null || date -d "${current_year}-${current_month}-01" +%Y-%m-%d
-            fi
-            ;;
-        quarterly)
-            local quarter_month=$(((($(date +%m) - 1) / 3) * 3 + 1))
-            if [ $(date +%d) -lt $PERIOD_START_DAY ] || [ $(date +%m) -eq $quarter_month ]; then
-                date -d "${current_year}-${quarter_month}-${PERIOD_START_DAY} -3 month" +'%Y-%m-%d'
-            else
-                date -d "${current_year}-${quarter_month}-${PERIOD_START_DAY}" +'%Y-%m-%d' 2>/dev/null || date -d "${current_year}-${quarter_month}-01" +%Y-%m-%d
-            fi
-            ;;
-        yearly)
-            if [ $(date +%d) -lt $PERIOD_START_DAY ] || [ $(date +%m) -eq 01 ]; then
-                date -d "${current_year}-01-${PERIOD_START_DAY} -1 year" +'%Y-%m-%d'
-            else
-                date -d "${current_year}-01-${PERIOD_START_DAY}" +'%Y-%m-%d' 2>/dev/null || date -d "${current_year}-01-01" +%Y-%m-%d
-            fi
-            ;;
-    esac
+    local current_year=$((10#$(date +%Y)))
+    local anchor_month=$(get_period_anchor_month)
+    local step=$(get_period_month_step)
+    local anchor_date=$(period_anchor_date "$current_year" "$anchor_month")
+
+    if [[ "$current_date" < "$anchor_date" ]]; then
+        read -r current_year anchor_month < <(add_months "$current_year" "$anchor_month" "-$step")
+        anchor_date=$(period_anchor_date "$current_year" "$anchor_month")
+    fi
+
+    echo "$anchor_date"
 }
 
 # 获取周期结束日期
 get_period_end_date() {
-    local current_date=$(date +%Y-%m-%d)
-    local current_month=$(date +%m)
-    local current_year=$(date +%Y)
-    
-    case $TRAFFIC_PERIOD in
-        monthly)
-            if [ $(date +%d) -lt $PERIOD_START_DAY ]; then
-                date -d "${current_year}-${current_month}-${PERIOD_START_DAY} -1 day" +'%Y-%m-%d'
-            else
-                date -d "${current_year}-${current_month}-${PERIOD_START_DAY} +1 month -1 day" +'%Y-%m-%d'
-            fi
-            ;;
-        quarterly)
-            local quarter_month=$(((($(date +%m) - 1) / 3) * 3 + 1))
-            if [ $(date +%d) -lt $PERIOD_START_DAY ] || [ $(date +%m) -eq $quarter_month ]; then
-                date -d "${current_year}-${quarter_month}-${PERIOD_START_DAY} +2 month -1 day" +'%Y-%m-%d'
-            else
-                date -d "${current_year}-${quarter_month}-${PERIOD_START_DAY} +5 month -1 day" +'%Y-%m-%d'
-            fi
-            ;;
-        yearly)
-            if [ $(date +%d) -lt $PERIOD_START_DAY ] || [ $(date +%m) -eq 01 ]; then
-                date -d "${current_year}-12-31" +'%Y-%m-%d'
-            else
-                date -d "$((current_year + 1))-12-31" +'%Y-%m-%d'
-            fi
-            ;;
-    esac
+    local start_date=$(get_period_start_date)
+    local start_year=${start_date%%-*}
+    local start_month=${start_date#*-}
+    start_month=${start_month%%-*}
+    local step=$(get_period_month_step)
+    local next_year next_month next_start
+
+    read -r next_year next_month < <(add_months "$((10#$start_year))" "$((10#$start_month))" "$step")
+    next_start=$(period_anchor_date "$next_year" "$next_month")
+    date -d "$next_start -1 day" +'%Y-%m-%d'
 }
 
 # 获取流量使用情况
@@ -393,7 +405,7 @@ get_traffic_usage() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 周期开始日期: $start_date, 周期结束日期: $end_date" >&2
     
     # 使用 vnstat JSON API 获取每日流量数据
-    local vnstat_json=$(vnstat -i $MAIN_INTERFACE --json 2>/dev/null)
+    local vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null)
     
     if [ -z "$vnstat_json" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无法获取 vnstat JSON 数据" >&2
@@ -451,14 +463,14 @@ check_and_limit_traffic() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
         if [ "$LIMIT_MODE" = "tc" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
-            tc qdisc add dev $MAIN_INTERFACE root tbf rate ${LIMIT_SPEED}kbit burst 32kbit latency 400ms
+            tc qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${LIMIT_SPEED}kbit" burst 32kbit latency 400ms
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
             shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，清除所有限制" | tee -a "$LOG_FILE"
-        tc qdisc del dev $MAIN_INTERFACE root 2>/dev/null
+        tc qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null
         shutdown -c 2>/dev/null  # 取消可能存在的关机计划
     fi
 }
@@ -471,7 +483,7 @@ check_reset_limit() {
     
     if [[ "$current_date" == "$period_start" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 新的流量周期开始，重置限制"| tee -a "$LOG_FILE"
-        tc qdisc del dev $MAIN_INTERFACE root 2>/dev/null
+        tc qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null
     fi
 }
 
@@ -510,7 +522,7 @@ if ! flock -n 9; then
 fi
 
     # 检查是否以 --run 模式运行
-    if [ "\$1" = "--run" ]; then
+    if [ "$1" = "--run" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 正在以自动化模式运行" | tee -a "$LOG_FILE"
         if read_config; then
             check_reset_limit

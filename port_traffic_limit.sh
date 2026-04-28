@@ -88,19 +88,134 @@ read_machine_config() {
     fi
 }
 
+# 日期工具：端口周期也按目标月份最大天数钳制起始日
+days_in_month() {
+    local year=$1
+    local month=$2
+    date -d "$(printf '%04d-%02d-01' "$year" "$month") +1 month -1 day" +%d
+}
+
+add_months() {
+    local year=$1
+    local month=$2
+    local delta=$3
+    local total=$((year * 12 + month - 1 + delta))
+    printf '%04d %02d\n' "$((total / 12))" "$((total % 12 + 1))"
+}
+
+period_anchor_date() {
+    local year=$1
+    local month=$2
+    local period_day=$3
+    local max_day=$((10#$(days_in_month "$year" "$month")))
+
+    if [ "$period_day" -gt "$max_day" ]; then
+        period_day=$max_day
+    fi
+
+    printf '%04d-%02d-%02d\n' "$year" "$month" "$period_day"
+}
+
+get_period_month_step() {
+    local traffic_period=$1
+    case $traffic_period in
+        quarterly) echo 3 ;;
+        yearly) echo 12 ;;
+        *) echo 1 ;;
+    esac
+}
+
+get_period_anchor_month() {
+    local traffic_period=$1
+    local current_month=$((10#$(date +%m)))
+
+    case $traffic_period in
+        quarterly) echo $((((current_month - 1) / 3) * 3 + 1)) ;;
+        yearly) echo 1 ;;
+        *) echo "$current_month" ;;
+    esac
+}
+
+get_current_period_start_date() {
+    local traffic_period=$1
+    local period_start_day=${2:-1}
+    local current_date=$(date +%Y-%m-%d)
+    local current_year=$((10#$(date +%Y)))
+    local anchor_month=$(get_period_anchor_month "$traffic_period")
+    local step=$(get_period_month_step "$traffic_period")
+    local anchor_date=$(period_anchor_date "$current_year" "$anchor_month" "$period_start_day")
+
+    if [[ "$current_date" < "$anchor_date" ]]; then
+        read -r current_year anchor_month < <(add_months "$current_year" "$anchor_month" "-$step")
+        anchor_date=$(period_anchor_date "$current_year" "$anchor_month" "$period_start_day")
+    fi
+
+    echo "$anchor_date"
+}
+
 # 获取端口配置
 get_port_config() {
     local port=$1
     if [ -f "$PORT_CONFIG_FILE" ]; then
-        jq -r ".ports[] | select(.port == $port)" "$PORT_CONFIG_FILE"
+        jq -c --argjson port "$port" '.ports[] | select(.port == $port)' "$PORT_CONFIG_FILE"
     fi
 }
 
 # 检查端口是否已配置
 port_exists() {
     local port=$1
-    local count=$(jq -r ".ports[] | select(.port == $port) | .port" "$PORT_CONFIG_FILE" 2>/dev/null | wc -l)
-    [ "$count" -gt 0 ]
+    jq -e --argjson port "$port" '.ports[] | select(.port == $port)' "$PORT_CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 获取端口当前入站计数字节。端口周期通过配置基线扣减，不清零系统计数器。
+get_port_in_bytes() {
+    local port=$1
+    local in_bytes
+
+    in_bytes=$(iptables -L ufw-before-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
+    if [ -z "$in_bytes" ] || [ "$in_bytes" = "0" ]; then
+        in_bytes=$(iptables -L ufw-user-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
+    fi
+    if [ -z "$in_bytes" ] || [ "$in_bytes" = "0" ]; then
+        in_bytes=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
+    fi
+
+    echo "${in_bytes:-0}"
+}
+
+update_port_baseline() {
+    local port=$1
+    local baseline_bytes=$2
+    local period_start=$3
+    local reset_date=$(date '+%Y-%m-%d')
+    local temp_file=$(mktemp)
+
+    jq --argjson port "$port" \
+       --argjson baseline "$baseline_bytes" \
+       --arg period_start "$period_start" \
+       --arg reset_date "$reset_date" \
+       '(.ports[] | select(.port == $port)) |=
+        (. + {
+          baseline_in_bytes: $baseline,
+          baseline_reset_date: $reset_date,
+          current_period_start: $period_start,
+          last_reset: $reset_date
+        })' "$PORT_CONFIG_FILE" > "$temp_file" && mv "$temp_file" "$PORT_CONFIG_FILE"
+}
+
+ensure_port_period_baseline() {
+    local port=$1
+    local config=$2
+    local traffic_period=$(echo "$config" | jq -r '.traffic_period')
+    local period_start_day=$(echo "$config" | jq -r '.period_start_day')
+    local configured_start=$(echo "$config" | jq -r '.current_period_start // ""')
+    local current_start=$(get_current_period_start_date "$traffic_period" "$period_start_day")
+
+    if [ "$configured_start" != "$current_start" ]; then
+        local current_bytes=$(get_port_in_bytes "$port")
+        update_port_baseline "$port" "$current_bytes" "$current_start"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 端口 $port 新周期开始，记录基线 ${current_bytes} bytes (周期起点: $current_start)" >> "$PORT_LOG_FILE"
+    fi
 }
 
 # 添加或更新端口配置
@@ -116,32 +231,48 @@ add_port_config() {
     local main_interface=$9
     local limit_mode=${10}
     local created_at=$(date '+%Y-%m-%d %H:%M:%S')
+    local current_period_start=$(get_current_period_start_date "$traffic_period" "$period_start_day")
+    local baseline_in_bytes=$(get_port_in_bytes "$port")
+    local baseline_reset_date=$(date '+%Y-%m-%d')
     
     # 删除旧配置（如果存在）
     local temp_file=$(mktemp)
-    jq "del(.ports[] | select(.port == $port))" "$PORT_CONFIG_FILE" > "$temp_file"
+    jq --argjson port "$port" 'del(.ports[] | select(.port == $port))' "$PORT_CONFIG_FILE" > "$temp_file"
     mv "$temp_file" "$PORT_CONFIG_FILE"
     
     # 添加新配置
-    local new_port=$(cat <<EOF
-{
-  "port": $port,
-  "description": "$description",
-  "traffic_limit": $traffic_limit,
-  "traffic_tolerance": $traffic_tolerance,
-  "traffic_mode": "$traffic_mode",
-  "traffic_period": "$traffic_period",
-  "period_start_day": $period_start_day,
-  "limit_speed": $limit_speed,
-  "main_interface": "$main_interface",
-  "limit_mode": "$limit_mode",
-  "created_at": "$created_at",
-  "last_reset": "$(date '+%Y-%m-%d')"
-}
-EOF
-)
-    
-    jq ".ports += [$new_port]" "$PORT_CONFIG_FILE" > "$temp_file"
+    jq --argjson port "$port" \
+       --arg description "$description" \
+       --argjson traffic_limit "$traffic_limit" \
+       --argjson traffic_tolerance "$traffic_tolerance" \
+       --arg traffic_mode "$traffic_mode" \
+       --arg traffic_period "$traffic_period" \
+       --argjson period_start_day "$period_start_day" \
+       --argjson limit_speed "$limit_speed" \
+       --arg main_interface "$main_interface" \
+       --arg limit_mode "$limit_mode" \
+       --arg created_at "$created_at" \
+       --arg last_reset "$baseline_reset_date" \
+       --argjson baseline_in_bytes "$baseline_in_bytes" \
+       --arg baseline_reset_date "$baseline_reset_date" \
+       --arg current_period_start "$current_period_start" \
+       '.ports += [{
+          port: $port,
+          description: $description,
+          traffic_limit: $traffic_limit,
+          traffic_tolerance: $traffic_tolerance,
+          traffic_mode: $traffic_mode,
+          traffic_period: $traffic_period,
+          period_start_day: $period_start_day,
+          limit_speed: $limit_speed,
+          main_interface: $main_interface,
+          limit_mode: $limit_mode,
+          created_at: $created_at,
+          last_reset: $last_reset,
+          baseline_in_bytes: $baseline_in_bytes,
+          baseline_reset_date: $baseline_reset_date,
+          current_period_start: $current_period_start
+        }]' "$PORT_CONFIG_FILE" > "$temp_file"
     mv "$temp_file" "$PORT_CONFIG_FILE"
     
     echo -e "${GREEN}端口 $port 配置已保存${NC}"
@@ -151,7 +282,7 @@ EOF
 delete_port_config() {
     local port=$1
     local temp_file=$(mktemp)
-    jq "del(.ports[] | select(.port == $port))" "$PORT_CONFIG_FILE" > "$temp_file"
+    jq --argjson port "$port" 'del(.ports[] | select(.port == $port))' "$PORT_CONFIG_FILE" > "$temp_file"
     mv "$temp_file" "$PORT_CONFIG_FILE"
     echo -e "${GREEN}端口 $port 配置已删除${NC}"
 }
@@ -204,20 +335,28 @@ init_iptables_rules() {
         fi
         
         # 添加INPUT规则到ufw-before-input链（在ESTABLISHED规则之前）
-        if ! iptables -L ufw-before-input -v -n | grep -q "dpt:$port"; then
-            # 在第2个位置插入（在lo接口之后，在ESTABLISHED规则之前）
+        if ! iptables -C ufw-before-input -i "$interface" -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I ufw-before-input 2 -i "$interface" -p tcp --dport "$port" -j ACCEPT
+        fi
+        if ! iptables -C ufw-before-input -i "$interface" -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I ufw-before-input 2 -i "$interface" -p udp --dport "$port" -j ACCEPT
+        fi
+        if iptables -C ufw-before-input -i "$interface" -p tcp --dport "$port" -j ACCEPT 2>/dev/null &&
+           iptables -C ufw-before-input -i "$interface" -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
             echo -e "${GREEN}已添加UFW入站统计规则到 ufw-before-input 链（端口 $port）${NC}"
         else
             echo -e "${GREEN}UFW入站统计规则已存在（端口 $port）${NC}"
         fi
         
         # 添加OUTPUT规则到ufw-before-output链（在ESTABLISHED规则之前）
-        if ! iptables -L ufw-before-output -v -n | grep -q "spt:$port"; then
-            # 在第2个位置插入（在lo接口之后，在ESTABLISHED规则之前）
+        if ! iptables -C ufw-before-output -o "$interface" -p tcp --sport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I ufw-before-output 2 -o "$interface" -p tcp --sport "$port" -j ACCEPT
+        fi
+        if ! iptables -C ufw-before-output -o "$interface" -p udp --sport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I ufw-before-output 2 -o "$interface" -p udp --sport "$port" -j ACCEPT
+        fi
+        if iptables -C ufw-before-output -o "$interface" -p tcp --sport "$port" -j ACCEPT 2>/dev/null &&
+           iptables -C ufw-before-output -o "$interface" -p udp --sport "$port" -j ACCEPT 2>/dev/null; then
             echo -e "${GREEN}已添加UFW出站统计规则到 ufw-before-output 链（端口 $port）${NC}"
         else
             echo -e "${GREEN}UFW出站统计规则已存在（端口 $port）${NC}"
@@ -225,14 +364,18 @@ init_iptables_rules() {
     else
         # 标准iptables环境
         # 检查并添加INPUT规则
-        if ! iptables -L INPUT -v -n | grep -q "dpt:$port"; then
+        if ! iptables -C INPUT -i "$interface" -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I INPUT -i "$interface" -p tcp --dport "$port" -j ACCEPT
+        fi
+        if ! iptables -C INPUT -i "$interface" -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I INPUT -i "$interface" -p udp --dport "$port" -j ACCEPT
         fi
         
         # 检查并添加OUTPUT规则
-        if ! iptables -L OUTPUT -v -n | grep -q "spt:$port"; then
+        if ! iptables -C OUTPUT -o "$interface" -p tcp --sport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I OUTPUT -o "$interface" -p tcp --sport "$port" -j ACCEPT
+        fi
+        if ! iptables -C OUTPUT -o "$interface" -p udp --sport "$port" -j ACCEPT 2>/dev/null; then
             iptables -I OUTPUT -o "$interface" -p udp --sport "$port" -j ACCEPT
         fi
         
@@ -244,6 +387,7 @@ init_iptables_rules() {
 get_port_traffic_usage() {
     local port=$1
     local interface=$2
+    local baseline_in_bytes=${3:-0}
     
     # ==================== 重要说明 ====================
     # 对于代理服务器(如xray/v2ray)场景：
@@ -265,21 +409,15 @@ get_port_traffic_usage() {
     # 如需精确监控代理总流量，请使用进程级监控(cgroup/conntrack)
     # =================================================
     
-    # 获取入站流量（字节）- UFW环境下需要从ufw-before-input读取
-    # 首先检查ufw-before-input（UFW环境下的正确位置）
-    local in_bytes=$(iptables -L ufw-before-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
-    # 如果为空，尝试ufw-user-input（兼容性）
-    if [ -z "$in_bytes" ] || [ "$in_bytes" = "0" ]; then
-        in_bytes=$(iptables -L ufw-user-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
-    fi
-    # 最后尝试标准INPUT链
-    if [ -z "$in_bytes" ] || [ "$in_bytes" = "0" ]; then
-        in_bytes=$(iptables -L INPUT -v -n -x | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
+    local raw_in_bytes=$(get_port_in_bytes "$port")
+    local in_bytes=$((raw_in_bytes - baseline_in_bytes))
+    if [ "$in_bytes" -lt 0 ]; then
+        in_bytes=0
     fi
     
     # 转换为GB（使用printf格式化，确保显示前导零）
     # 使用 bc 时屏蔽 stderr 并在出错时返回 0，保证不会打印 (standard_in) 1: syntax error
-    local in_gb=$(printf "%.2f" $(echo "scale=2; $in_bytes / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0"))
+    local in_gb=$(printf "%.3f" $(echo "scale=3; $in_bytes / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0"))
     
     # 代理场景：出站流量 = 入站流量（估算值）
     # 原因：客户端请求多少数据，服务器就需要下载并转发相应数据
@@ -287,7 +425,7 @@ get_port_traffic_usage() {
     
     # 总流量 = 入站 × 2（估算值）
     # 实际流量可能略高(1-20%)因协议开销、重传等因素
-    local total_gb=$(printf "%.2f" $(echo "scale=2; $in_gb * 2" | bc 2>/dev/null || echo "0"))
+    local total_gb=$(printf "%.3f" $(echo "scale=3; $in_gb * 2" | bc 2>/dev/null || echo "0"))
     
     echo "$in_gb,$out_gb,$total_gb"
 }
@@ -304,10 +442,12 @@ apply_tc_limit() {
     fi
     
     # 为端口创建class和filter
-    local class_id="1:$port"
-    tc class add dev "$interface" parent 1: classid "$class_id" htb rate "${speed}kbit"
-    tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 match ip sport "$port" 0xffff flowid "$class_id"
-    tc filter add dev "$interface" protocol ip parent 1:0 prio 1 u32 match ip dport "$port" 0xffff flowid "$class_id"
+    local class_id="1:$(printf '%x' "$port")"
+    local filter_prio=$port
+    tc class replace dev "$interface" parent 1: classid "$class_id" htb rate "${speed}kbit" ceil "${speed}kbit"
+    tc filter del dev "$interface" protocol ip parent 1:0 prio "$filter_prio" 2>/dev/null || true
+    tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 match ip sport "$port" 0xffff flowid "$class_id"
+    tc filter add dev "$interface" protocol ip parent 1:0 prio "$filter_prio" u32 match ip dport "$port" 0xffff flowid "$class_id"
     
     echo -e "${GREEN}TC限速已应用（端口 $port: ${speed}kbit/s）${NC}"
 }
@@ -316,9 +456,11 @@ apply_tc_limit() {
 remove_tc_limit() {
     local port=$1
     local interface=$2
+    local filter_prio=$port
+    local class_id="1:$(printf '%x' "$port")"
     
-    tc filter del dev "$interface" prio 1 2>/dev/null
-    tc class del dev "$interface" classid "1:$port" 2>/dev/null
+    tc filter del dev "$interface" protocol ip parent 1:0 prio "$filter_prio" 2>/dev/null
+    tc class del dev "$interface" classid "$class_id" 2>/dev/null
     
     echo -e "${GREEN}TC限速已移除（端口 $port）${NC}"
 }
@@ -327,10 +469,18 @@ remove_tc_limit() {
 block_port() {
     local port=$1
     
-    iptables -I INPUT -p tcp --dport "$port" -j DROP
-    iptables -I INPUT -p udp --dport "$port" -j DROP
-    iptables -I OUTPUT -p tcp --sport "$port" -j DROP
-    iptables -I OUTPUT -p udp --sport "$port" -j DROP
+    if ! iptables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$port" -j DROP
+    fi
+    if ! iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; then
+        iptables -I INPUT -p udp --dport "$port" -j DROP
+    fi
+    if ! iptables -C OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null; then
+        iptables -I OUTPUT -p tcp --sport "$port" -j DROP
+    fi
+    if ! iptables -C OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null; then
+        iptables -I OUTPUT -p udp --sport "$port" -j DROP
+    fi
     
     echo -e "${RED}端口 $port 已被阻断${NC}"
 }
@@ -339,10 +489,10 @@ block_port() {
 unblock_port() {
     local port=$1
     
-    iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
-    iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null
-    iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null
-    iptables -D OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null
+    while iptables -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; do :; done
+    while iptables -D INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p tcp --sport "$port" -j DROP 2>/dev/null; do :; done
+    while iptables -D OUTPUT -p udp --sport "$port" -j DROP 2>/dev/null; do :; done
     
     echo -e "${GREEN}端口 $port 阻断已解除${NC}"
 }
@@ -356,6 +506,8 @@ check_and_limit_port_traffic() {
     if [ -z "$config" ]; then
         return
     fi
+    ensure_port_period_baseline "$port" "$config"
+    config=$(get_port_config "$port")
     
     local traffic_limit=$(echo "$config" | jq -r '.traffic_limit')
     local traffic_tolerance=$(echo "$config" | jq -r '.traffic_tolerance')
@@ -363,9 +515,10 @@ check_and_limit_port_traffic() {
     local limit_mode=$(echo "$config" | jq -r '.limit_mode')
     local limit_speed=$(echo "$config" | jq -r '.limit_speed')
     local interface=$(echo "$config" | jq -r '.main_interface')
+    local baseline_in_bytes=$(echo "$config" | jq -r '.baseline_in_bytes // 0')
     
     # 获取流量使用
-    local usage=$(get_port_traffic_usage "$port" "$interface")
+    local usage=$(get_port_traffic_usage "$port" "$interface" "$baseline_in_bytes")
     local in_gb=$(echo "$usage" | cut -d',' -f1)
     local out_gb=$(echo "$usage" | cut -d',' -f2)
     local total_gb=$(echo "$usage" | cut -d',' -f3)
@@ -373,8 +526,8 @@ check_and_limit_port_traffic() {
     # 根据模式选择流量值
     local current_usage
     case "$traffic_mode" in
-        "outbound") current_usage=$out_gb ;;
-        "inbound") current_usage=$in_gb ;;
+        "out") current_usage=$out_gb ;;
+        "in") current_usage=$in_gb ;;
         "total") current_usage=$total_gb ;;
         "max") current_usage=$(echo "$in_gb $out_gb" | awk '{print ($1>$2)?$1:$2}') ;;
         *) current_usage=$total_gb ;;
@@ -516,15 +669,15 @@ port_config_wizard() {
         echo ""
         echo -e "${CYAN}流量统计模式：${NC}"
         echo "1) total - 入站+出站（默认）"
-        echo "2) outbound - 仅出站"
-        echo "3) inbound - 仅入站"
+        echo "2) out - 仅出站"
+        echo "3) in - 仅入站"
         echo "4) max - 取最大值"
         read -p "请选择 [默认: 1]: " mode_choice
         [ -z "$mode_choice" ] && mode_choice="1"
         case $mode_choice in
             1) traffic_mode="total" ;;
-            2) traffic_mode="outbound" ;;
-            3) traffic_mode="inbound" ;;
+            2) traffic_mode="out" ;;
+            3) traffic_mode="in" ;;
             4) traffic_mode="max" ;;
             *) traffic_mode="total" ;;
         esac
@@ -543,8 +696,14 @@ port_config_wizard() {
             *) traffic_period="monthly" ;;
         esac
         
-        read -p "周期起始日 (1-28) [默认: 1]: " period_start_day
-        [ -z "$period_start_day" ] && period_start_day=1
+        while true; do
+            read -p "周期起始日 (1-31) [默认: 1]: " period_start_day
+            [ -z "$period_start_day" ] && period_start_day=1
+            if [[ "$period_start_day" =~ ^[0-9]+$ ]] && [ "$period_start_day" -ge 1 ] && [ "$period_start_day" -le 31 ]; then
+                break
+            fi
+            echo -e "${RED}无效的周期起始日，请输入 1-31${NC}"
+        done
         
         echo ""
         echo -e "${CYAN}限制模式：${NC}"
@@ -1174,8 +1333,11 @@ main() {
         if [ -n "$2" ]; then
             # 移除特定端口
             if port_exists "$2"; then
+                local config=$(get_port_config "$2")
+                local interface=$(echo "$config" | jq -r '.main_interface')
                 delete_port_config "$2"
                 unblock_port "$2"
+                remove_tc_limit "$2" "$interface"
                 echo -e "${GREEN}端口 $2 配置已移除${NC}"
             else
                 echo -e "${RED}端口 $2 不存在${NC}"

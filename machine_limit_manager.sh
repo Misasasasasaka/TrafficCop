@@ -59,15 +59,20 @@ remove_cron_job() {
 # 添加定时任务
 add_cron_job() {
     echo "添加定时任务..."
+    local cron_entry="*/5 * * * * cd $WORK_DIR && bash trafficcop.sh --run $CRON_COMMENT"
+    local current_cron=$(crontab -l 2>/dev/null)
     
-    # 检查是否已存在
-    if crontab -l 2>/dev/null | grep -q "trafficcop.sh"; then
+    # 检查是否已存在正确任务
+    if echo "$current_cron" | grep -Fq "$cron_entry"; then
         echo "! 定时任务已存在"
         return
     fi
     
-    # 添加新的定时任务
-    (crontab -l 2>/dev/null; echo "*/5 * * * * cd $WORK_DIR && bash trafficcop.sh --cron $CRON_COMMENT") | crontab -
+    # 移除旧参数/旧脚本名的任务后添加新的定时任务
+    {
+        echo "$current_cron" | grep -v "trafficcop.sh\\|traffic_monitor.sh"
+        echo "$cron_entry"
+    } | crontab -
     
     echo "✓ 定时任务已添加"
 }
@@ -129,7 +134,7 @@ enable_machine_limit() {
     # 3. 立即执行一次监控（测试配置）
     echo "启动TrafficCop监控测试..."
     cd "$WORK_DIR"
-    bash "$SCRIPT_PATH" --cron
+    bash "$SCRIPT_PATH" --run
     
     echo ""
     echo -e "${GREEN}✓ 机器限速已启用${NC}"

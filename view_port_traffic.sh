@@ -25,6 +25,7 @@ get_port_traffic_usage() {
     local port=$1
     local interface=$2
     local traffic_mode=$3
+    local baseline_in_bytes=${4:-0}
     
     # ==================== 重要说明 ====================
     # 对于代理服务器(如xray/v2ray)场景：
@@ -46,16 +47,16 @@ get_port_traffic_usage() {
     # 如需精确监控代理总流量，请使用进程级监控(cgroup/conntrack)
     # =================================================
     
-    # 获取入站流量（字节）- UFW环境下需要从ufw-before-input读取
-    # 首先检查ufw-before-input（UFW环境下的正确位置）
     local rx_bytes=$(iptables -L ufw-before-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
-    # 如果为空，尝试ufw-user-input（兼容性）
     if [ -z "$rx_bytes" ] || [ "$rx_bytes" = "0" ]; then
         rx_bytes=$(iptables -L ufw-user-input -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
     fi
-    # 最后尝试标准INPUT链
     if [ -z "$rx_bytes" ] || [ "$rx_bytes" = "0" ]; then
         rx_bytes=$(iptables -L INPUT -v -n -x 2>/dev/null | grep "dpt:$port" | awk '{sum+=$2} END {printf "%.0f", sum+0}')
+    fi
+    rx_bytes=$((rx_bytes - baseline_in_bytes))
+    if [ "$rx_bytes" -lt 0 ]; then
+        rx_bytes=0
     fi
     
     # 代理场景：出站流量 = 入站流量（估算值）
@@ -162,9 +163,10 @@ show_port_info() {
     local limit_speed=$(echo "$port_config" | jq -r '.limit_speed')
     local period=$(echo "$port_config" | jq -r '.traffic_period')
     local last_reset=$(echo "$port_config" | jq -r '.last_reset')
+    local baseline_in_bytes=$(echo "$port_config" | jq -r '.baseline_in_bytes // 0')
     
     # 获取当前流量使用
-    local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode")
+    local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode" "$baseline_in_bytes")
     # 计算阈值，屏蔽 bc 语法错误
     local limit_threshold=$(echo "$traffic_limit - $traffic_tolerance" | bc 2>/dev/null || echo 0)
     local percentage=$(calculate_percentage "$current_usage" "$traffic_limit")
@@ -274,8 +276,9 @@ show_all_ports() {
         local interface=$(echo "$port_config" | jq -r '.main_interface')
         local traffic_mode=$(echo "$port_config" | jq -r '.traffic_mode')
         local traffic_limit=$(echo "$port_config" | jq -r '.traffic_limit')
+        local baseline_in_bytes=$(echo "$port_config" | jq -r '.baseline_in_bytes // 0')
         
-        local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode")
+        local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode" "$baseline_in_bytes")
     total_usage=$(echo "$total_usage + $current_usage" | bc 2>/dev/null || echo "$total_usage")
     total_limit=$(echo "$total_limit + $traffic_limit" | bc 2>/dev/null || echo "$total_limit")
     done
@@ -309,41 +312,31 @@ export_json() {
     
     local ports=$(cat "$PORTS_CONFIG_FILE" | jq -r '.ports[].port')
     local export_file="$WORK_DIR/port_traffic_report_$(date +%Y%m%d_%H%M%S).json"
-    
-    echo '{' > "$export_file"
-    echo '  "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'",' >> "$export_file"
-    echo '  "ports": [' >> "$export_file"
-    
-    local first=true
+    local ports_json='[]'
+
     for port in $ports; do
         local port_config=$(get_port_config "$port")
         local interface=$(echo "$port_config" | jq -r '.main_interface')
         local traffic_mode=$(echo "$port_config" | jq -r '.traffic_mode')
         local traffic_limit=$(echo "$port_config" | jq -r '.traffic_limit')
         local description=$(echo "$port_config" | jq -r '.description')
+        local baseline_in_bytes=$(echo "$port_config" | jq -r '.baseline_in_bytes // 0')
         
-        local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode")
+        local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode" "$baseline_in_bytes")
         local percentage=$(calculate_percentage "$current_usage" "$traffic_limit")
-        
-        if [ "$first" = false ]; then
-            echo '    ,' >> "$export_file"
-        fi
-        first=false
-        
-        cat >> "$export_file" << EOF
-    {
-      "port": $port,
-      "description": "$description",
-      "current_usage": $current_usage,
-      "traffic_limit": $traffic_limit,
-      "percentage": $percentage,
-      "traffic_mode": "$traffic_mode"
-    }
-EOF
+        local port_json=$(jq -n \
+            --argjson port "$port" \
+            --arg description "$description" \
+            --argjson current_usage "$current_usage" \
+            --argjson traffic_limit "$traffic_limit" \
+            --argjson percentage "$percentage" \
+            --arg traffic_mode "$traffic_mode" \
+            '{port:$port, description:$description, current_usage:$current_usage, traffic_limit:$traffic_limit, percentage:$percentage, traffic_mode:$traffic_mode}')
+        ports_json=$(jq -c --argjson ports "$ports_json" --argjson port_json "$port_json" '$ports + [$port_json]' <<< '{}')
     done
-    
-    echo '  ]' >> "$export_file"
-    echo '}' >> "$export_file"
+
+    jq -n --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" --argjson ports "$ports_json" \
+        '{timestamp:$timestamp, ports:$ports}' > "$export_file"
     
     echo -e "${GREEN}报告已导出到: ${export_file}${NC}"
 }
@@ -362,27 +355,26 @@ main() {
         fi
         
         local ports=$(cat "$PORTS_CONFIG_FILE" | jq -r '.ports[].port')
-        echo '{"ports":['
-        
-        local first=true
+        local ports_json='[]'
         for port in $ports; do
             local port_config=$(get_port_config "$port")
             local interface=$(echo "$port_config" | jq -r '.main_interface')
             local traffic_mode=$(echo "$port_config" | jq -r '.traffic_mode')
             local traffic_limit=$(echo "$port_config" | jq -r '.traffic_limit')
             local description=$(echo "$port_config" | jq -r '.description')
+            local baseline_in_bytes=$(echo "$port_config" | jq -r '.baseline_in_bytes // 0')
             
-            local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode")
-            
-            if [ "$first" = false ]; then
-                echo ','
-            fi
-            first=false
-            
-            echo -n "{\"port\":\"$port\",\"description\":\"$description\",\"usage\":$current_usage,\"limit\":$traffic_limit}"
+            local current_usage=$(get_port_traffic_usage "$port" "$interface" "$traffic_mode" "$baseline_in_bytes")
+            local port_json=$(jq -n \
+                --arg port "$port" \
+                --arg description "$description" \
+                --argjson usage "$current_usage" \
+                --argjson limit "$traffic_limit" \
+                '{port:$port, description:$description, usage:$usage, limit:$limit}')
+            ports_json=$(jq -c --argjson ports "$ports_json" --argjson port_json "$port_json" '$ports + [$port_json]' <<< '{}')
         done
-        
-        echo ']}'
+
+        jq -c -n --argjson ports "$ports_json" '{ports:$ports}'
     elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
         echo "用法: $0 [选项]"
         echo ""
