@@ -159,7 +159,7 @@ TrafficCop 现在集成了 Telegram Bot 功能，可以发送以下通知：
 
 **支持自定义每日流量报告的时间，你想每个小鸡什么时候通知就什么时候，当然你也可以设置都是一样的时间，一下子冒出来一堆，享受坐拥数🐔的快感**
 
-要使用此功能，请在脚本配置过程中提供你的 Telegram Bot Token 和 Chat ID。
+要使用此功能，请在脚本配置过程中提供你的 Telegram Bot Token、Chat ID 和 Topic ID。
 
 Telegram Bot Token 在你创建机器人时会显示。
 
@@ -168,6 +168,8 @@ Chat ID获取方法：https://api.telegram.org/bot${BOT_TOKEN}/getUpdates
 ${BOT_TOKEN}是你的 Telegram Bot Token 
 
 Chat ID还可以通过bot获取，更简单，比如[username_to_id_bot](https://t.me/username_to_id_bot)
+
+Topic ID 对应 Telegram Bot API 的 message_thread_id，可在群组话题内给机器人发消息后，通过 getUpdates 返回内容里的 message_thread_id 获取。
 
 ### 相关命令
 一键推送脚本（调用api，版本最新，可能会403）：

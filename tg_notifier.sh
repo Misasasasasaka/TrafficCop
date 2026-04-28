@@ -203,7 +203,7 @@ read_config() {
     source "$CONFIG_FILE"
 
     # 检查必要的配置项是否都存在
-    if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] || [ -z "$MACHINE_NAME" ] || [ -z "$DAILY_REPORT_TIME" ]; then
+    if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] || [ -z "$MESSAGE_THREAD_ID" ] || [ -z "$MACHINE_NAME" ] || [ -z "$DAILY_REPORT_TIME" ]; then
         echo "配置文件不完整，需要重新进行配置。"
         return 1
     fi
@@ -216,6 +216,7 @@ write_config() {
     cat > "$CONFIG_FILE" << EOF
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
+MESSAGE_THREAD_ID="$MESSAGE_THREAD_ID"
 DAILY_REPORT_TIME="$DAILY_REPORT_TIME"
 MACHINE_NAME="$MACHINE_NAME"
 EOF
@@ -232,7 +233,7 @@ initial_config() {
     echo "提示：按 Enter 保留当前配置，输入新值则更新配置"
     echo ""
     
-    local new_token new_chat_id new_machine_name new_daily_report_time
+    local new_token new_chat_id new_message_thread_id new_machine_name new_daily_report_time
 
     # Bot Token
     if [ -n "$BOT_TOKEN" ]; then
@@ -270,6 +271,22 @@ initial_config() {
         read -r new_chat_id
     done
 
+    # Topic ID
+    if [ -n "$MESSAGE_THREAD_ID" ]; then
+        echo "请输入Telegram Topic ID(message_thread_id) [当前: $MESSAGE_THREAD_ID]: "
+    else
+        echo "请输入Telegram Topic ID(message_thread_id): "
+    fi
+    read -r new_message_thread_id
+    if [[ -z "$new_message_thread_id" ]] && [[ -n "$MESSAGE_THREAD_ID" ]]; then
+        new_message_thread_id="$MESSAGE_THREAD_ID"
+        echo "  → 保留原配置"
+    fi
+    while [[ -z "$new_message_thread_id" ]]; do
+        echo "Topic ID 不能为空。请重新输入: "
+        read -r new_message_thread_id
+    done
+
     # 机器名称
     if [ -n "$MACHINE_NAME" ]; then
         echo "请输入机器名称 [当前: $MACHINE_NAME]: "
@@ -305,6 +322,7 @@ initial_config() {
     # 更新配置文件（使用引号防止空格等特殊字符问题）
     BOT_TOKEN="$new_token"
     CHAT_ID="$new_chat_id"
+    MESSAGE_THREAD_ID="$new_message_thread_id"
     MACHINE_NAME="$new_machine_name"
     DAILY_REPORT_TIME="$new_daily_report_time"
     
@@ -323,7 +341,7 @@ send_throttle_warning() {
     local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="⚠️ [${MACHINE_NAME}]限速警告：流量已达到限制，已启动 TC 模式限速。${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "message_thread_id=$MESSAGE_THREAD_ID" -d "text=$message"
 }
 
 # 获取端口流量摘要（专为Telegram格式化）
@@ -390,14 +408,14 @@ send_throttle_lifted() {
     local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="✅ [${MACHINE_NAME}]限速解除：流量已恢复正常，所有限制已清除。${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "message_thread_id=$MESSAGE_THREAD_ID" -d "text=$message"
 }
 
 # 发送新周期开始通知
 send_new_cycle_notification() {
     local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local message="🔄 [${MACHINE_NAME}]新周期开始：新的流量统计周期已开始，之前的限速（如果有）已自动解除。"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "message_thread_id=$MESSAGE_THREAD_ID" -d "text=$message"
 }
 
 # 发送关机警告
@@ -405,7 +423,7 @@ send_shutdown_warning() {
     local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="🚨 [${MACHINE_NAME}]关机警告：流量已达到严重限制，系统将在 1 分钟后关机！${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "message_thread_id=$MESSAGE_THREAD_ID" -d "text=$message"
 }
 
 
@@ -416,13 +434,14 @@ test_telegram_notification() {
     local response
     response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
         -d "chat_id=${CHAT_ID}" \
+        -d "message_thread_id=${MESSAGE_THREAD_ID}" \
         -d "text=${message}" \
         -d "disable_notification=true")
     
     if echo "$response" | grep -q '"ok":true'; then
         echo "✅ [${MACHINE_NAME}]测试消息已成功发送，请检查您的Telegram。"
     else
-        echo "❌ [${MACHINE_NAME}]发送测试消息失败。请检查您的BOT_TOKEN和CHAT_ID设置。"
+        echo "❌ [${MACHINE_NAME}]发送测试消息失败。请检查您的BOT_TOKEN、CHAT_ID和MESSAGE_THREAD_ID设置。"
     fi
 }
 
@@ -534,7 +553,7 @@ update_cron_time() {
 daily_report() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始生成每日报告"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : DAILY_REPORT_TIME=$DAILY_REPORT_TIME"| tee -a "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : BOT_TOKEN=${BOT_TOKEN:0:5}... CHAT_ID=$CHAT_ID"| tee -a "$CRON_LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : BOT_TOKEN=${BOT_TOKEN:0:5}... CHAT_ID=$CHAT_ID MESSAGE_THREAD_ID=$MESSAGE_THREAD_ID"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 日志文件路径: $LOG_FILE"| tee -a "$CRON_LOG"
 
     # 反向读取日志文件，查找第一个同时包含"当前使用流量"和"限制流量"的行
@@ -689,7 +708,7 @@ daily_report() {
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 尝试发送Telegram消息"| tee -a "$CRON_LOG"
 
-    response=$(curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message")
+    response=$(curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "message_thread_id=$MESSAGE_THREAD_ID" -d "text=$message")
 
     if echo "$response" | grep -q '"ok":true'; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送成功"| tee -a "$CRON_LOG"
@@ -757,6 +776,7 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "每日报告时间: $DAILY_REPORT_TIME"
             echo "Bot Token: ${BOT_TOKEN:0:10}..." # 只显示前10个字符
             echo "Chat ID: $CHAT_ID"
+            echo "Topic ID: $MESSAGE_THREAD_ID"
             echo "======================================"
             echo "1. 检查流量并推送"
             echo "2. 手动发送每日报告"

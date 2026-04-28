@@ -148,7 +148,7 @@ TrafficCop now integrates Telegram Bot functionality, which can send the followi
 
 **Supports custom daily traffic report times - you can set when each VPS notifies you, or set them all to the same time to enjoy the feeling of owning multiple VPS instances at once!**
 
-To use this feature, provide your Telegram Bot Token and Chat ID during script configuration.
+To use this feature, provide your Telegram Bot Token, Chat ID, and Topic ID during script configuration.
 
 Telegram Bot Token is displayed when you create a bot.
 
@@ -157,6 +157,8 @@ Chat ID can be obtained via: https://api.telegram.org/bot${BOT_TOKEN}/getUpdates
 ${BOT_TOKEN} is your Telegram Bot Token
 
 Chat ID can also be obtained more easily through bots like [username_to_id_bot](https://t.me/username_to_id_bot)
+
+Topic ID maps to Telegram Bot API's message_thread_id. Send a message to the bot inside the group topic, then read message_thread_id from the getUpdates response.
 
 ### Related Commands
 One-Click Push Script (API call, latest version, may return 403):
