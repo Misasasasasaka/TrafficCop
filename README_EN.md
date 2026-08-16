@@ -461,7 +461,7 @@ sudo curl -o /root/TrafficCop/traffic_monitor_config.txt https://raw.githubuserc
 ```
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ypq123456789/TrafficCop&type=Date)](https://star-history.com/#ypq123456789/TrafficCop&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=ypq123456789/TrafficCop&type=Date)](https://star-history.dera.page/#ypq123456789/TrafficCop&Date)
 
 ## Telegram Group:
 https://t.me/+ydvXl1_OBBBiZWM1
